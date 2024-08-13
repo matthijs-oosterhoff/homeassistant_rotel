@@ -135,7 +135,7 @@ class RotelDevice(MediaPlayerEntity):
 
     def volume_down(self) -> None:
         """Step volume down one increment."""
-        self.send_request('vol_down!')
+        self.send_request('vol_dwn!')
 
     def set_volume_level(self, volume: float) -> None:
         """Set volume level, range 0..1."""
