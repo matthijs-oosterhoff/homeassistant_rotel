@@ -55,39 +55,49 @@ async def async_setup_platform(
 ) -> None:
     """Set up the NAD platform."""
 
-    rotel = RotelDevice(config)
+    rotel = RotelDevice(config, hass)
     add_entities([rotel], True)
     _LOGGER.debug("ROTEL: RotelDevice initialized")
-    await rotel.start(hass)
+    asyncio.create_task(rotel.init_connection())
 
 
 class RotelDevice(MediaPlayerEntity):
     _attr_icon = "mdi:speaker-multiple"
     _attr_supported_features = SUPPORT_ROTEL
 
-    def __init__(self, config):
+    def __init__(self, config, hass):
         self._attr_name = config[CONF_NAME]
         self._host = config[CONF_HOST]
         self._port = config[CONF_PORT]
+        self._hass = hass
         self._transport = None
         self._source_dict = AUDIO_SOURCES
         self._source_dict_reverse = {value: key for key, value in self._source_dict.items()}
         self._msg_buffer = ''
 
-    async def start(self, hass):
+    async def init_connection(self):
         """
         Let Home Assistant create and manage a TCP connection,
         hookup the transport protocol to our device and send an initial query to our device.
         """
-        transport, protocol = await hass.loop.create_connection(
-            RotelProtocol,
-            self._host,
-            self._port
-        )
+        _LOGGER.debug("ROTEL: initializing connection")
+        while True:
+            try:
+                transport, protocol = await self._hass.loop.create_connection(
+                    RotelProtocol,
+                    self._host,
+                    self._port
+                )
+                _LOGGER.debug("ROTEL: connected")
+                break
+            except Exception as e:
+                _LOGGER.debug("ROTEL: unable to connect waiting")
+                await asyncio.sleep(10)
+
         protocol.set_device(self)
         self._transport = transport
         self.send_request('model?power?volume?mute?source?freq?')
-        _LOGGER.debug("ROTEL: started.")
+        _LOGGER.debug("ROTEL: connection successfull.")
 
     def send_request(self, message):
         """
@@ -135,7 +145,7 @@ class RotelDevice(MediaPlayerEntity):
 
     def volume_down(self) -> None:
         """Step volume down one increment."""
-        self.send_request('vol_down!')
+        self.send_request('vol_dwn!')
 
     def set_volume_level(self, volume: float) -> None:
         """Set volume level, range 0..1."""
@@ -220,3 +230,4 @@ class RotelProtocol(asyncio.Protocol):
 
     def connection_lost(self, exc):
         _LOGGER.warning('ROTEL: Connection Lost !')
+        asyncio.create_task(self._device.init_connection())
