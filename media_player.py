@@ -81,6 +81,10 @@ class RotelDevice(MediaPlayerEntity):
         hookup the transport protocol to our device and send an initial query to our device.
         """
         _LOGGER.debug("ROTEL: initializing connection")
+        if self._transport:
+            self._transport = None
+            await self.async_update_ha_state(True)
+
         while True:
             try:
                 transport, protocol = await self._hass.loop.create_connection(
@@ -98,6 +102,7 @@ class RotelDevice(MediaPlayerEntity):
         self._transport = transport
         self.send_request('model?power?volume?mute?source?freq?')
         _LOGGER.debug("ROTEL: connection successfull.")
+        await self.async_update_ha_state(True)
 
     def send_request(self, message):
         """
@@ -113,10 +118,7 @@ class RotelDevice(MediaPlayerEntity):
     @property
     def available(self) -> bool:
         """Return if device is available."""
-        # return self.state is not None
-        return self._attr_state is not None \
-            and self._transport is not None \
-            and not self._transport.is_closing()
+        return self._transport is not None
 
     @property
     def source_list(self):
