@@ -25,6 +25,9 @@ _LOGGER = logging.getLogger(__name__)
 DEFAULT_PORT = 9590
 DEFAULT_NAME = "Rotel"
 
+HEARTBEAT_INTERVAL_SECONDS = 10
+HEARTBEAT_TIMEOUT_SECONDS = 5
+
 SUPPORT_ROTEL = (
         MediaPlayerEntityFeature.VOLUME_SET
         | MediaPlayerEntityFeature.VOLUME_MUTE
@@ -53,12 +56,11 @@ async def async_setup_platform(
         add_entities: AddEntitiesCallback,
         discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
-    """Set up the NAD platform."""
-
+    """Set up the Rotel platform."""
     rotel = RotelDevice(config, hass)
     add_entities([rotel], True)
     _LOGGER.debug("ROTEL: RotelDevice initialized")
-    asyncio.create_task(rotel.init_connection())
+    asyncio.create_task(rotel.connect())
 
 
 class RotelDevice(MediaPlayerEntity):
@@ -71,17 +73,22 @@ class RotelDevice(MediaPlayerEntity):
         self._port = config[CONF_PORT]
         self._hass = hass
         self._transport = None
+        self._protocol = None
         self._source_dict = AUDIO_SOURCES
-        self._source_dict_reverse = {value: key for key, value in self._source_dict.items()}
+        self._source_dict_reverse = {v: k for k, v in self._source_dict.items()}
         self._msg_buffer = ''
+        self._heartbeat_task = None
+        self._pending_response = None
+        self._send_lock = asyncio.Lock()
 
-    async def init_connection(self):
+    async def connect(self):
         """
         Let Home Assistant create and manage a TCP connection,
         hookup the transport protocol to our device and send an initial query to our device.
         """
-        _LOGGER.debug("ROTEL: initializing connection")
+        _LOGGER.info("ROTEL: initializing connection")
         if self._transport:
+            self._transport.close()
             self._transport = None
             await self.async_update_ha_state(True)
 
@@ -92,57 +99,92 @@ class RotelDevice(MediaPlayerEntity):
                     self._host,
                     self._port
                 )
-                _LOGGER.debug("ROTEL: connected")
+                _LOGGER.debug("ROTEL: Connected to device")
                 break
             except Exception as e:
-                _LOGGER.debug("ROTEL: unable to connect waiting")
+                _LOGGER.warning(
+                    "ROTEL: Connection failed (%s), retrying in 10s...", e
+                )
                 await asyncio.sleep(10)
 
         protocol.set_device(self)
         self._transport = transport
-        self.send_request('model?power?volume?mute?source?freq?')
-        _LOGGER.debug("ROTEL: connection successfull.")
+        _LOGGER.info("ROTEL: Connection successfull.")
+        self._init_heartbeat_task()
         await self.async_update_ha_state(True)
 
-    def send_request(self, message):
-        """
-        Send messages to the amp (which is a bit cheeky and may need a hard reset if command
-        was not properly formatted
-        """
-        try:
-            self._transport.write(message.encode())
-            _LOGGER.debug('ROTEL: data sent: {!r}'.format(message))
-        except:
-            _LOGGER.warning('ROTEL: transport not ready !')
+    def connection_lost(self):
+        if self._transport is not None and self._transport.is_closing():
+            _LOGGER.debug("ROTEL: Ignoring connection_lost, connection is closing.")
+            pass
+        asyncio.create_task(self.connect())
+
+    def _init_heartbeat_task(self):
+        if self._heartbeat_task is None:
+            self._heartbeat_task = self._hass.loop.create_task(self._heartbeat_loop())
+
+    async def _heartbeat_loop(self):
+        """Periodically send a request to detect network loss."""
+        while True:
+            try:
+                # Create a future to wait for response
+                self._pending_response = asyncio.Future()
+                await self._send_request('model?power?volume?mute?source?freq?')
+
+                # Wait for response with timeout
+                await asyncio.wait_for(self._pending_response, timeout=HEARTBEAT_TIMEOUT_SECONDS)
+
+            except asyncio.TimeoutError:
+                _LOGGER.warning("ROTEL: No response from heartbeat, reconnecting...")
+                await self.connect()
+            except Exception as e:
+                _LOGGER.warning("ROTEL: Heartbeat failed: %s", e)
+                await self.connect()
+            finally:
+                await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
+    async def _send_request(self, message: str):
+        """Async-safe send with lock to avoid interleaving messages."""
+        async with self._send_lock:
+            if self._transport and not self._transport.is_closing():
+                try:
+                    self._transport.write(message.encode())
+                    _LOGGER.debug('ROTEL: data sent: %r', message)
+                except Exception as e:
+                    _LOGGER.warning("ROTEL: Send failed (%s)", e)
+
+    def send_request(self, message: str):
+        """Public method for synchronous-style calls."""
+        if self._hass:
+            self._hass.loop.create_task(self._send_request(message))
+        else:
+            _LOGGER.warning("ROTEL: Hass loop not ready, cannot send message")
 
     @property
     def available(self) -> bool:
         """Return if device is available."""
-        return self._transport is not None
+        return self._attr_state is not None \
+            and self._transport is not None \
+            and not self._transport.is_closing()
 
     @property
     def source_list(self):
-        """List of available input sources."""
         return sorted(self._source_dict_reverse)
 
     def turn_off(self) -> None:
-        """Turn the media player off."""
         self.send_request('power_off!')
 
     def turn_on(self) -> None:
-        """Turn the media player on."""
         self.send_request('power_on!')
 
     def select_source(self, source: str) -> None:
-        """Select input source."""
         if source not in self._source_dict_reverse:
             _LOGGER.error(f'Selected unknown source: {source}')
         else:
-            key = self._source_dict_reverse.get(source)
+            key = self._source_dict_reverse[source]
             self.send_request(f'{key}!')
 
     def volume_up(self) -> None:
-        """Step volume up one increment."""
         self.send_request('vol_up!')
 
     def volume_down(self) -> None:
@@ -150,15 +192,14 @@ class RotelDevice(MediaPlayerEntity):
         self.send_request('vol_dwn!')
 
     def set_volume_level(self, volume: float) -> None:
-        """Set volume level, range 0..1."""
         self.send_request('vol_%s!' % str(round(volume * 100)).zfill(2))
 
     def mute_volume(self, mute: bool) -> None:
-        """Mute (true) or unmute (false) media player."""
-        self.send_request('mute_%s!' % (mute is True and 'on' or 'off'))
+        self.send_request('mute_%s!' % ('on' if mute else 'off'))
 
     def handle_incoming(self, key, value):
         _LOGGER.debug(f'ROTEL: handle incoming: {key} => {value}')
+
         if key == 'volume':
             self._attr_volume_level = int(value) / 100
         elif key == 'power':
@@ -183,12 +224,17 @@ class RotelDevice(MediaPlayerEntity):
             else:
                 self._attr_source = self._source_dict.get(value)
         elif key == 'freq':
-            # TODO
-            _LOGGER.debug(f'got freq {value}')
+            _LOGGER.debug(f'ROTEL: got freq {value}')
+
+        # Resolve heartbeat future if waiting
+        if self._pending_response and not self._pending_response.done():
+            self._pending_response.set_result(True)
+
+        # Update HA state
+        self.schedule_update_ha_state()
 
 
 class RotelProtocol(asyncio.Protocol):
-
     def __init__(self):
         self._device = None
         self._msg_buffer = ''
@@ -200,36 +246,27 @@ class RotelProtocol(asyncio.Protocol):
         _LOGGER.debug('ROTEL: Transport initialized')
 
     def data_received(self, data):
-        _LOGGER.debug('ROTEL: Data received {!r}'.format(data.decode()))
         try:
             self._msg_buffer += data.decode()
-            _LOGGER.debug(f'ROTEL: msg buffer: {self._msg_buffer}')
+            _LOGGER.debug('ROTEL: Data received %r', data.decode())
 
-            # According to the spec, all status updates are terminated with '$',
-            # In practice, it seems some status updates are terminated with '!', for example 'network_status=connected!'
             commands = re.split('[$!]', self._msg_buffer)
 
             # check for incomplete commands
             if self._msg_buffer.endswith('$') or self._msg_buffer.endswith('!'):
-                # command terminated properly, clear buffer
                 self._msg_buffer = ''
             else:
-                # last command not terminated, put it back on the buffer
                 self._msg_buffer = commands[-1]
 
-            # last item is either empty or an unterminated command, get rid of it.
             commands.pop(-1)
 
-            #  update internal state depending on amp messages
             for cmd in commands:
-                key, value = cmd.split('=')
-                self._device.handle_incoming(key, value)
-
-            # make sure internal state is propagated to the UI
-            self._device.schedule_update_ha_state()
-        except:
-            _LOGGER.warning('ROTEL: Data received but not ready {!r}'.format(data.decode()))
+                if '=' in cmd:
+                    key, value = cmd.split('=')
+                    self._device.handle_incoming(key, value)
+        except Exception:
+            _LOGGER.warning('ROTEL: Data received but not ready %r', data.decode())
 
     def connection_lost(self, exc):
-        _LOGGER.warning('ROTEL: Connection Lost !')
-        asyncio.create_task(self._device.init_connection())
+        _LOGGER.warning('ROTEL: Connection lost !')
+        self._device.connection_lost()
