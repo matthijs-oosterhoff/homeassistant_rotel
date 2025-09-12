@@ -206,7 +206,7 @@ class RotelDevice(MediaPlayerEntity):
             if value == 'on':
                 self._attr_state = MediaPlayerState.ON
             elif value == 'standby':
-                self._attr_state = MediaPlayerState.STANDBY
+                self._attr_state = MediaPlayerState.IDLE
             else:
                 self._attr_state = None
                 self.send_request('power?')
